@@ -1,0 +1,533 @@
+Adapted from Robert Morris' notes
+
+-------------------
+Remote Procedure Call (RPC)
+  a key piece of distrib sys machinery -- and lab 1
+  goal: easy-to-program network communication
+    hides most details of client/server communication
+    client call is much like ordinary procedure call
+    server handlers are much like ordinary procedures
+  alternatives?
+    sockets (manually format/send network packets directly)
+	ZeroMQ
+	MPI
+    ...
+  RPC is widely used!
+    OpenSource ones: Finagle (Twitter) Thrift (Apache/Facebook)
+
+RPC ideally makes net communication look just like fn call:
+  Client:
+    z = fn(x, y)
+  Server:
+    fn(x, y) {
+      compute
+      return z
+    }
+  RPC aims for this level of transparency
+  Hope: even novice programmers can use function call!
+
+RPC message diagram:
+  Client             Server
+    request--->
+       <---response
+
+RPC software structure:
+  client app         handlers
+    stubs           dispatcher
+   RPC lib           RPC lib
+     net  ------------ net
+
+
+Client  Client     RPC       Net      RPC             Server      Handler
+ App     Stub      lib                lib              Stub
+
+call    marshall   send     request   recv  dispatch  unmarshall  fn(args)
+                   wait               wait                        work...
+return  unmarshall recv     response  send            marshall    return
+ 
+A few details:
+  Marshalling is tricky for arrays, pointers, objects, &c
+  Things you cannot pass: pointers, objects etc.
+
+  Binding: Client needs to find server's network address 
+
+  Threading:
+  	Client need multiple threads, so have >1 call outstanding, match up replies to requests
+  	Handler may be slow, server also need multiple threads handling requests concurrently
+
+Hard challenge: failures
+  network may drop, delay, duplicate, re-order messages
+  network might break, and maybe recover
+  server might crash, and maybe re-start
+
+  can and should we hide this from client applications and server handlers?
+
+Birrell RPC paper
+  many Birrell papers later
+  from Xerox PARC, which invented LANs and workstations in 1970s
+  paper's main concerns:
+    naming
+    minimize # of packets (slow CPUs -> slow pkt handling) (we use TCP)
+    failures
+
+Naming RPC servers
+  Used Grapevine, a name service (a little like DNS)
+  Export(service name, server host)
+  Import(service name) -> server host
+  level of indirection:
+    clients need not hard-code server names
+    multiple servers (use closest)
+    replacement of servers
+
+Failure:
+Suppose the underlying communication is based on UDP
+  -- unreliable datagram
+
+How should clients handle failure? 
+  client sends a request
+  suppose network could not get the request packet through..
+  what will client observe?
+  what should the client do?
+  how long should client wait before rxmt?
+
+Now suppose the network delivered request, but could not get response through...
+  what will client observe?
+  what should the client do?
+
+RPC problem:
+  Client may not see a response from the server
+  It does *not* know if the server saw the request!
+    Maybe net/server failed just before sending reply
+
+Simplest scheme: "at least once" behavior
+  RPC library waits for response for a while
+  If none arrives, re-send the request
+  Do this a few times
+  Still no response -- return an error to the application
+
+Q: is "at least once" easy for applications to cope with?
+
+Would a simple key/value service work under at-least-once?
+  *draw diagram*
+  client sends Put(a=1)
+  server processes Put(a=1), network drops reply
+  client sends Put(a=1) again
+  server processes Put(a=1),
+  reply reaches client
+
+  what if it isn't a put but "deduct $10 from bank account"?
+
+  Even simple key/value is not always correct
+  client sends Put(a=1)
+  server processes Put(a=1), network delays reply
+  client sends Put(a=1) again
+  earlier reply reaches client
+  client sends Put(a=2),
+  server processes Put(a=2),
+  server processes duplicated Put(a=1),
+
+  End result is a=2!  clearly wrong!
+
+Is at-least-once ever OK?
+  yes: if no side effects -- read-only operations (or idem-potent ops)
+  yes: if application has its own plan for detecting duplicates
+
+Better RPC behavior: "at most once"
+  idea: server RPC code detects duplicate requests
+    returns previous reply instead of re-running handler
+  client includes unique ID (UID) with each request
+    uses same UID for re-send
+  server:
+    if seen[uid]:
+      r = old[uid]
+    else
+      r = handler()
+      old[uid] = r
+      seen[uid] = true
+
+Some at-most-once complexities
+  how to ensure UID is unique?
+    big random number?
+    combine unique client ID (ip address?) with sequence #?
+When can server discard old saved return values?
+  after e.g. five seconds? no!
+  server can discard if client will never retransmit
+    == if client has received response
+  have client tell server which replies it has received
+  or: client tells server it has received all replies up through some XID
+    lab RPC's xid_rep, in every request message
+
+
+  server must eventually discard info about old RPCs
+    when is discard safe?
+    idea:
+      unique client IDs
+      per-client RPC sequence numbers
+      client includes "seen all replies <= X" with every RPC
+      much like TCP sequence #s and acks
+    or only allow client one outstanding RPC at a time
+      arrival of seq+1 allows server to discard all <= seq
+    or client agrees to keep retrying for < 5 minutes
+      server discards after 5+ minutes
+  how to handle dup req while original is still executing?
+    server doesn't know reply yet; don't want to run twice
+    idea: "pending" flag per executing RPC; wait or ignore
+
+Semantics of at-most-once RPC
+   If an RPC returns OKAY, then server has executed handler once
+   If an RPC returns FAIL, then server has executed zero or one time, unknown which.
+
+What if an at-most-once server crashes?
+  if at-most-once duplicate info in memory, server will forget.
+    how to avoid accepting duplicate requests
+  maybe it should write the duplicate info to disk?
+  it can just reply with RPC failure!! 
+
+  How does server know it got an old message meant for its previous reincarnation?
+	server gets a unique nonce (i.e. converstaion identifier) upon start up
+	(how to ensure uniqueness? clock-based, random number)
+	clients obtain server's nonce upon "binding", attach nonce to every request
+	server replies failure if a request's nonce does not match
+
+How do applications cope with failed RPC?
+  key-value. apps can retry failed rpc
+  banking app. 
+    maybe you transferred the money, maybe you didn't
+    but you know it didn't transfer twice
+    and you know you have to track down what actually happened
+      e.g. ask bank clerks to check transaction record?
+
+Exactly-once is possible but very expensive
+  Server must remember dup info. across reboots (e.g. on disk)
+  not all applications need it
+
+Birrell RPC protocol provides "at-most-once"
+  why? much cheaper than exactly once, more useful than at-least-once
+
+How to decide if a request is a re-sent copy of one sent before crash?
+
+Lab RPC request message format
+  (TCP/IP headers...)
+  client nonce
+  xid
+  server nonce
+  xid_rep
+  proc#
+  arguments...
+
+Lab RPC response message format
+  (TCP/IP headers...)
+  xid
+  error code
+  return value
+
+[draw these on the board as arrow diagrams]
+
+Example 1: ordinary calls
+  bind req: xid=1 sn=? proc=1
+  bind reply: xid=1 sn=22
+  ...
+  req: xid=6 sn=22 xid_rep=5 proc=2 args...
+    r[6] = r1
+    server deletes xid<=5 from s[]/r[]
+  reply: xid=6 r1
+  req: xid=7 sn=22 xid_rep=6 proc=2 args...
+  reply: xid=7
+
+Why not let xid_rep be implicitly xid - 1 ?
+  to allow multiple outstanding RPCs from one client
+  example: xid=7 sent before reply for xid=6 arrives
+
+Client has to compute xid_rep
+  it is highest xid through which all replies have been received
+  our code keeps set of replied-to xids, looks for contiguous prefix
+
+Example 2: duplicate requests (client resends too soon, or response lost)
+  req: xid=8 ...
+  req: xid=8 ... (again)
+  if handler has finished when 2nd req arrives:
+    reply with r[8]
+    thus two replies with xid=8
+    client will ignore 2nd reply, no thread waiting for that xid
+  if handler has not finished:
+    ignore request (thus need more than just DONE -- INPROGRESS)
+
+Example 3: server reboot
+  req: xid=9 sn=22 ...
+  server crash, reboot, new sn=23
+  req: xid=9 sn=22 ... (retransmission)
+  server sees 22 != 23, replies FORGOTTEN
+
+l02.cc hand-out has simplified RPC code from lab1
+  I've omitted error checks, locks, &c
+  Simplified some C++ notation
+  Check the real code!
+
+kv_demo.cc
+  creates a kv_client, tells it where to connect
+
+kv_client::kv_client
+  creates rpcc, tells it where to connect
+  calls bind() to get server_nonce
+
+kv_client::stat
+  calls call(), proc #, arguments, &return
+
+rpcc::call1
+  msg: xid proc cn sn xid_rep args...
+  xid_rep_window_.front()?
+  update_xid_rep(xid)?
+
+rpcc::got_pdu
+
+rpcs::rpcs
+
+rpcs::dispatch
+  why the nonce check? what prob does this solve?
+  when could INPROGRESS occur?
+  is FORGOTTEN possible? how?
+    long delayed request
+    (rebooted server is dealt w/ separately)
+  what is the client nonce for?
+
+checkduplicate_and_update(cn, xid, xid_rep, &b, &sz)
+  must keep, for each cn, state about each xid.
+    done? b+sz if done.
+  if s[cn/xid] == INPROGRESS
+    INPROGRESS
+  if s[cn/xid] == DONE
+    DONE, return b and sz
+  if xid <= previous xid_rep
+    FORGOTTEN
+  else
+    s[cn/xid] = INPROGRESS
+    NEW
+
+  must also trim state
+    discard any cn/xid if xid <= xid_rep
+    must also free buf
+
+what must add_reply(cn, xid, b, sz) do?
+  checkduplicate_and_update already set s[cn/xid] = INPROGRESS
+  s[cn/xid] = DONE
+  remember b and sz.
+
+------------Threads----------------
+
+Thread = "thread of control"
+  threads allow one program to (logically) do many things at once
+  a thread includes some per-thread state:
+    program counter
+    stack pointer
+    register set
+    stack
+    maybe state in the o/s (e.g. what it is waiting for)
+  other state is shared by all threads in a program:
+    memory
+    file descriptors
+
+Example:
+  int x = 0;
+  f(){
+    int y = 0;
+    y = y + 1;
+    print x + y
+  }
+  main(){
+    create_thread(f);
+    create_thread(f);
+    ...;
+  }
+
+Q: will the threads print 1 or 2? Why?
+Q: is there any way for one thread to r/w the other's y?
+
+Why use threads?
+  exploit several processors to run an application faster
+  interleave different activities in a convenient way
+    one thread computes while another waits for disk read
+    interleave background spell-check w/ foreground editing
+    let one lock_server thread wait for lock while processing
+      other client requests in other threads
+  you can view the last three as merely a structuring convenience
+    so the programmer doesn't have to write the interleaved code
+    but it's a big convenience!
+
+Pitfalls of multithreaded programming
+  races; example?
+    may be difficult to reproduce
+  deadlock; example?
+    better bug to have than race; you program stops when it happens
+  livelock; example?
+  bad performance; example?
+
+At a minimum, a thread interface must support:
+  creating threads
+  mutual exclusion to avoid races
+  coordination to let threads wait for + signal events
+
+Pthread interface
+  standard interface, for C / UNIX
+  not unlike the one described in the paper
+  we use it in the labs
+
+Interface
+  shortened names, real names are e.g. pthread_create, pthread_mutex_lock
+  threads
+    tid = create()
+    join(tid)
+  mutex
+    lock(m)
+    unlock(m)
+  condition variables
+    wait(cv, m)
+      caller must hold m
+      wait() releases m, re-acquires before return
+    signal(cv)
+      caller should hold m (why?)
+      wakes up one thread (or none if none waiting)
+    broadcast(cv)
+      caller should hold m
+      wakes up all threads waiting
+  other stuff
+    which we don't use.
+
+Paper does a nice job teaching how to program with threads, in
+particular for servers (like the labs). Worth rereading the paper as
+you get more experience.
+
+Example: let's look at fifo.h
+  rpc system uses it for work queues
+  first walk through code
+
+Scoped locks
+  just thin wrapper around pthread mutex lock/unlock
+  helps you not have to remember to unlock
+  saves a bunch of typing
+    if(...){
+      ScopedLock sl(&m);
+      if(...)
+	return ...;  // sl.~ScopedLock releases mu
+      ...
+      // sl.~ScopedLock releases mu
+    }
+
+What if we deleted the ScopedLock at start of enq?
+  at start of deq?
+
+Condition variables:
+  what if wait() was inside if(), not while()?
+  what if enq() called just before deq()'s wait?
+  what if we deleted signal at end of enq? at end of deq?
+  what if broadcast instead of signal?
+  what if while loop in enq just spun, no call to wait?
+
+What is the fifo's mutex protecting?
+  it makes code sequences atomic
+  specifically:
+    list<> operations (vs other operations, e.g. e->nxt=head;head=e)
+    enq's not-full check and push (vs another enq)
+    deq's not-empty check and pop (vs another deq)
+    deq's *e= and pop (vs another deq)
+    enq's full-check and wait (vs deq's signal)
+    deq's empty-check and wait (vs enq's signal)
+
+Deadlock
+  example:
+  thread-1:
+      lock(m1);
+	  lock(m2);
+	  ...
+  thread-2:
+      lock(m2);
+	  lock(m1);
+	  ...
+  how to fix?
+    release one lock before acquiring the other
+    or always acquire locks in the same order (e.g. for bank transfer)
+  hard if locks are in different modules
+    shouldn't have to know about each others' internals
+
+Locking granularity
+  one mutex for whole lock_server?
+  suppose we found handlers were often waiting for that one mutex
+    what are reasonable options?
+    one mutex per client?
+    one mutex per lock?
+  if one mutex per lock
+    still need one mutex to protect table of locks
+  danger of many locks---deadlock and races 
+
+How does the lab RPC library use threads?
+
+client classes:
+  rpcc (one per server connection)
+  connection (one per rpcc, may come and go)
+  PollMgr (one per process, shared by all connections)
+
+client threads: (rpcc side)
+  many app threads
+    waits for reply in call1
+  a few networking threads
+    sends rpc requests 
+    recvs rpc replies and makes up-call to rpcc:got_pdu with whole msg
+          - rpcc::got_pdu wakes up sleeping app thread
+
+server threads: (rpcs side)
+  a few worker threads 
+    deque from ThrPool's fifo
+    each call rpcs::dispatch with some received RPC request
+  a few networking threads
+    accept incoming tcp connections
+	sends rpc replies
+	recvs rpc requests
+       up-call to rpcs::got_pdu
+       enq() request into ThrPool' fifo queue
+
+why ThrPool?
+  why not fire up a new thread per RPC request?
+
+Let's run through abbreviated RPC code in handout
+  call1:
+    why locks m_ at start/end, ca.m in middle?
+    wait(ca.c)
+  got_pdu:
+    broadcast(ca.c)
+    lock order, deadlock...
+  dispatch:
+    why the nonce check? what prob does this solve?
+  when could INPROGRESS occur?
+  when could FORGOTTEN occur?
+    long delayed request
+  what is the client nonce for?
+
+RPC and mutexes may produce distributed deadlock
+  suppose server s1's handler does this:
+    lock m
+    rpc call s2
+    unlock m
+  and server s2's handler does this:
+    rpc call s1
+  
+checkduplicate_and_update(cn, xid, xid_rep, &b, &sz)
+  must keep s[cn/xid] -- nil, INPROGRESS, DONE
+    if DONE, also b+sz
+  if s[cn/xid] == INPROGRESS
+    return INPROGRESS
+  if s[cn/xid] == DONE
+    return DONE, return b and sz
+  if xid <= previous xid_rep
+    return FORGOTTEN
+  else
+    s[cn/xid] = INPROGRESS
+    return NEW
+
+  must also trim s[]
+    discard s[cn/xid] if xid <= xid_rep
+    and free buf
+
+what must add_reply(cn, xid, b, sz) do?
+  checkduplicate_and_update already set s[cn/xid] = INPROGRESS
+  s[cn/xid] = DONE
+  remember b and sz.
+
